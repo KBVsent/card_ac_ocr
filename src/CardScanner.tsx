@@ -16,11 +16,13 @@ declare global {
 }
 
 const CODE_CROPS: Crop[] = [
+  { x: 42, y: 77.7, width: 56.5, height: 10.4 },
   { x: 43, y: 82, width: 54.5, height: 9 },
-  { x: 37, y: 77, width: 62, height: 18 },
 ];
 const ACCESS_NUMBER_CROP: Crop = { x: 1, y: 0, width: 98, height: 74 };
 const CAMERA_CROP_MARGIN = 0.04;
+const CANONICAL_CARD_WIDTH = 1280;
+const CANONICAL_CARD_HEIGHT = 808;
 
 let openCvPromise: Promise<CvRuntime> | null = null;
 
@@ -112,10 +114,9 @@ function warpCard(sourceCanvas: HTMLCanvasElement, cv: CvRuntime, points: Point[
   const rightHeight = distance(ordered[1], ordered[2]);
   const measuredWidth = Math.max(topWidth, bottomWidth);
   const measuredHeight = Math.max(leftHeight, rightHeight);
-  const longSide = Math.max(measuredWidth, measuredHeight);
-  const scale = Math.min(1, 1600 / longSide);
-  const outputWidth = Math.max(300, Math.round(measuredWidth * scale));
-  const outputHeight = Math.max(200, Math.round(measuredHeight * scale));
+  const portrait = measuredHeight > measuredWidth;
+  const outputWidth = portrait ? CANONICAL_CARD_HEIGHT : CANONICAL_CARD_WIDTH;
+  const outputHeight = portrait ? CANONICAL_CARD_WIDTH : CANONICAL_CARD_HEIGHT;
   const source = cv.imread(sourceCanvas);
   const destination = new cv.Mat();
   const opaqueDestination = new cv.Mat();
@@ -157,7 +158,20 @@ function warpCard(sourceCanvas: HTMLCanvasElement, cv: CvRuntime, points: Point[
   sourcePoints.delete();
   destinationPoints.delete();
   transform.delete();
-  return canvas.height > canvas.width ? rotateCanvas(canvas, 90) : canvas;
+  return portrait ? rotateCanvas(canvas, 90) : canvas;
+}
+
+function normalizeCardSize(source: HTMLCanvasElement) {
+  const landscape = source.width >= source.height ? source : rotateCanvas(source, 90);
+  const canvas = document.createElement("canvas");
+  canvas.width = CANONICAL_CARD_WIDTH;
+  canvas.height = CANONICAL_CARD_HEIGHT;
+  const context = canvas.getContext("2d");
+  if (!context) throw new Error("浏览器无法归一化卡片尺寸");
+  context.imageSmoothingEnabled = true;
+  context.imageSmoothingQuality = "high";
+  context.drawImage(landscape, 0, 0, canvas.width, canvas.height);
+  return canvas;
 }
 
 function warpWideRegion(sourceCanvas: HTMLCanvasElement, cv: CvRuntime, points: Point[]) {
@@ -255,20 +269,45 @@ function scoreAccessCodeBoxes(
       contour.delete();
     }
     let bestAligned = 0;
+    let bestScore = 0;
     for (const seed of boxes) {
       const row = boxes
         .filter((box) => Math.abs(box.y - seed.y) < warped.rows * 0.11)
         .sort((a, b) => a.x - b.x);
       const widths = row.map((box) => box.width).sort((a, b) => a - b);
       const medianWidth = widths[Math.floor(widths.length / 2)] ?? 1;
-      const aligned = row.filter(
+      const consistent = row.filter(
         (box) => box.width > medianWidth * 0.55 && box.width < medianWidth * 1.65,
+      );
+
+      // A printed letter box normally produces both an inner and an outer
+      // contour. Count overlapping x positions once, otherwise the real ten
+      // ACCESS CODE boxes are often miscounted as roughly twenty boxes.
+      const unique: typeof consistent = [];
+      for (const box of consistent) {
+        const previous = unique[unique.length - 1];
+        if (!previous || Math.abs(box.x - previous.x) > medianWidth * 0.65) {
+          unique.push(box);
+        }
+      }
+      const gaps = unique.slice(1).map((box, index) => box.x - unique[index].x);
+      const sortedGaps = [...gaps].sort((a, b) => a - b);
+      const medianGap = sortedGaps[Math.floor(sortedGaps.length / 2)] ?? 1;
+      const regularGaps = gaps.filter(
+        (gap) => gap > medianGap * 0.55 && gap < medianGap * 1.45,
       ).length;
-      bestAligned = Math.max(bestAligned, aligned);
+      const aligned = unique.length;
+      const countScore = Math.max(0, 10 - Math.abs(10 - aligned)) * 5;
+      const spacingScore = gaps.length ? (regularGaps / gaps.length) * 20 : 0;
+      const score = countScore + spacingScore;
+      if (score > bestScore) {
+        bestScore = score;
+        bestAligned = aligned;
+      }
     }
     return {
       aligned: bestAligned,
-      score: Math.max(0, 10 - Math.abs(10 - bestAligned)) * 4,
+      score: bestScore,
     };
   } finally {
     grey.delete();
@@ -340,7 +379,11 @@ function detectAccessCodeRegion(sourceCanvas: HTMLCanvasElement, cv: CvRuntime) 
           const warped = cv.imread(warpedCanvas);
           const structure = scoreAccessCodeBoxes(warped, cv);
           warped.delete();
-          if (structure.score >= 24) {
+          if (
+            structure.aligned >= 8 &&
+            structure.aligned <= 12 &&
+            structure.score >= 55
+          ) {
             candidates.push({
               points: points.map((point) => ({
                 x: point.x / detectionScale,
@@ -629,7 +672,8 @@ function splitIntoCodeGroups(source: HTMLCanvasElement) {
 }
 
 function scoreCandidate(candidate: Candidate) {
-  return Math.abs(candidate.digits.length - 20) * 12 - candidate.confidence;
+  if (candidate.digits.length === 20) return -10_000 - candidate.confidence;
+  return Math.abs(candidate.digits.length - 20) * 100 - candidate.confidence;
 }
 
 export default function CardScanner() {
@@ -891,8 +935,27 @@ export default function CardScanner() {
   };
 
   const recognize = async () => {
-    const sourceCanvas = canvasRef.current;
-    if (!sourceCanvas || busy) return;
+    const previewCanvas = canvasRef.current;
+    const sourceImage = imageRef.current;
+    if (!previewCanvas || !sourceImage || busy) return;
+
+    // Always rebuild the recognition input from the original image. The preview
+    // may show a corrected card after a successful run, but a second click must
+    // still process exactly the same source pixels as the first click.
+    const sourceCanvas = document.createElement("canvas");
+    const sourceScale = Math.min(
+      1,
+      2000 / Math.max(sourceImage.naturalWidth, sourceImage.naturalHeight),
+    );
+    sourceCanvas.width = Math.round(sourceImage.naturalWidth * sourceScale);
+    sourceCanvas.height = Math.round(sourceImage.naturalHeight * sourceScale);
+    sourceCanvas.getContext("2d")?.drawImage(
+      sourceImage,
+      0,
+      0,
+      sourceCanvas.width,
+      sourceCanvas.height,
+    );
     setBusy(true);
     setDigits("");
     setRawText("");
@@ -905,17 +968,12 @@ export default function CardScanner() {
       setStatus("正在加载视觉检测组件…");
       const [cv, tesseract] = await Promise.all([loadOpenCv(), import("tesseract.js")]);
       setProgress(0.12);
-      setStatus("正在寻找 ACCESS CODE 字符框与数字区域…");
-      const directAccessRegion = detectAccessCodeRegion(sourceCanvas, cv);
+      setStatus("正在检测卡片边缘并建立固定坐标系…");
       const detection = detectCard(sourceCanvas, cv);
-      const normalizedCard = detection?.canvas ?? wholeImageFallback(sourceCanvas);
-      const refinedAccessRegion = detection
-        ? detectAccessCodeRegion(normalizedCard, cv)
-        : null;
-      const accessRegions = [directAccessRegion, refinedAccessRegion].filter(
-        (region): region is NonNullable<typeof region> => Boolean(region),
+      const normalizedCard = normalizeCardSize(
+        detection?.canvas ?? wholeImageFallback(sourceCanvas),
       );
-      setCardDetected(Boolean(accessRegions.length || detection));
+      setCardDetected(Boolean(detection));
 
       if (!workerRef.current) {
         setStatus("首次使用：正在加载本地数字识别模型…");
@@ -947,12 +1005,19 @@ export default function CardScanner() {
       let best: Candidate | null = null;
       let attempt = 0;
       let usedAccessAnchor = false;
+      let usedFixedLayout = false;
       let successfulPreview: HTMLCanvasElement | null = null;
+      let groupReviewSource: HTMLCanvasElement | null = null;
+      let groupReviewPreview: HTMLCanvasElement | null = null;
+      let groupReviewScore = Number.POSITIVE_INFINITY;
 
-      const recognizePrepared = async (
+      const recognizeLine = async (
         prepared: HTMLCanvasElement,
-        trustTwentyDigitLine = false,
+        preview: HTMLCanvasElement,
+        label: string,
       ) => {
+        attempt += 1;
+        setStatus(`${label}（第 ${attempt} 次）…`);
         const result = await workerRef.current!.recognize(prepared);
         const candidate: Candidate = {
           text: result.data.text.trim(),
@@ -960,127 +1025,109 @@ export default function CardScanner() {
           confidence: result.data.confidence,
         };
         if (!best || scoreCandidate(candidate) < scoreCandidate(best)) best = candidate;
-        if (trustTwentyDigitLine && candidate.digits.length === 20) return true;
-        if (candidate.digits.length < 15) return false;
-
-        setStatus("已定位数字行，正在按五组四位结构复核…");
-        await workerRef.current!.setParameters({
-          tessedit_pageseg_mode: tesseract.PSM.SINGLE_WORD,
-        });
-        const groupResults: Candidate[] = [];
-        for (const group of splitIntoCodeGroups(prepared)) {
-          const groupResult = await workerRef.current!.recognize(group);
-          groupResults.push({
-            text: groupResult.data.text.trim(),
-            digits: groupResult.data.text.replace(/\D/g, ""),
-            confidence: groupResult.data.confidence,
-          });
-        }
-        await workerRef.current!.setParameters({
-          tessedit_pageseg_mode: tesseract.PSM.RAW_LINE,
-        });
-
-        const wholeGroups = candidate.text
-          .split(/\s+/)
-          .map((group) => group.replace(/\D/g, ""))
-          .filter(Boolean);
         if (
-          wholeGroups.length === 5 &&
-          wholeGroups.every((group) => group.length >= 3 && group.length <= 4)
+          candidate.digits.length >= 15 &&
+          candidate.digits.length < 20 &&
+          scoreCandidate(candidate) < groupReviewScore
         ) {
-          const mergedGroups = wholeGroups.map((wholeGroup, index) =>
-            wholeGroup.length === 4
-              ? wholeGroup
-              : groupResults[index]?.digits.length === 4
-                ? groupResults[index].digits
-                : wholeGroup,
-          );
-          if (mergedGroups.every((group) => group.length === 4)) {
-            const merged: Candidate = {
-              text: mergedGroups.join(" "),
-              digits: mergedGroups.join(""),
-              confidence:
-                (candidate.confidence +
-                  groupResults.reduce((sum, group) => sum + group.confidence, 0) /
-                    groupResults.length) /
-                2,
-            };
-            best = merged;
-            return true;
-          }
+          groupReviewSource = prepared;
+          groupReviewPreview = preview;
+          groupReviewScore = scoreCandidate(candidate);
         }
-
-        const grouped: Candidate = {
-          text: groupResults.map((group) => group.text).join(" "),
-          digits: groupResults.map((group) => group.digits).join(""),
-          confidence:
-            groupResults.reduce((sum, group) => sum + group.confidence, 0) /
-            groupResults.length,
-        };
-        if (!best || scoreCandidate(grouped) < scoreCandidate(best)) best = grouped;
-        return (
-          groupResults.every((group) => group.digits.length === 4) &&
-          grouped.confidence >= 60
-        );
+        if (candidate.digits.length !== 20) return false;
+        successfulPreview = preview;
+        return true;
       };
 
-      accessSearch: for (const accessRegion of accessRegions) {
-        const accessOrientations = [
-          accessRegion.canvas,
-          rotateCanvas(accessRegion.canvas, 180),
-        ];
-        for (const orientation of accessOrientations) {
-          attempt += 1;
-          setStatus(`已匹配 ACCESS CODE 字符框结构，正在以 20 位为目标复核（第 ${attempt} 次）…`);
-          const prepared = prepareCrop(orientation, ACCESS_NUMBER_CROP, false);
-          if (await recognizePrepared(prepared, true)) {
-            usedAccessAnchor = true;
-            successfulPreview = orientation;
-            break accessSearch;
-          }
-        }
-      }
-
-      if (!usedAccessAnchor) {
-        const secondPassDetection = detection ? detectCard(normalizedCard, cv) : null;
-        const cardStages = [normalizedCard];
-        if (secondPassDetection) cardStages.push(secondPassDetection.canvas);
-
-        outer: for (const cardStage of cardStages) {
-          const orientations = [cardStage, rotateCanvas(cardStage, 180)];
+      if (detection) {
+        const orientations = [normalizedCard, rotateCanvas(normalizedCard, 180)];
+        fixedLayout: for (const binary of [false, true]) {
           for (const orientation of orientations) {
-            attempt += 1;
-            setStatus(`正在分离 ACCESS CODE 数字行并以 20 位为目标复核（第 ${attempt} 次）…`);
-            const wideCodeBlock = extractCrop(orientation, CODE_CROPS[1]);
-            const isolatedNumberLine = prepareCrop(
-              wideCodeBlock,
-              { x: 8, y: 4, width: 91, height: 57 },
-              false,
-            );
-            if (await recognizePrepared(isolatedNumberLine, true)) {
-              successfulPreview = orientation;
-              break outer;
-            }
-
-            const preciseEnhanced = prepareCrop(orientation, CODE_CROPS[0], false);
-            for (const [cropIndex, crop] of CODE_CROPS.entries()) {
-              for (const binary of cropIndex === 0 ? [false, true] : [false]) {
-                attempt += 1;
-                setStatus(`正在尝试其他数字裁剪方式（第 ${attempt} 次）…`);
-                const prepared = cropIndex === 0 && !binary
-                  ? preciseEnhanced
-                  : prepareCrop(orientation, crop, binary);
-                if (await recognizePrepared(prepared)) {
-                  successfulPreview = orientation;
-                  break outer;
-                }
+            for (const crop of CODE_CROPS) {
+              const prepared = prepareCrop(orientation, crop, binary);
+              if (
+                await recognizeLine(
+                  prepared,
+                  orientation,
+                  binary
+                    ? "正在复核固定数字区域的二值化结果"
+                    : "正在读取卡片底部固定数字区域",
+                )
+              ) {
+                usedFixedLayout = true;
+                break fixedLayout;
               }
             }
           }
         }
       }
 
-      // recognizePrepared mutates this closure variable, which TypeScript's
+      let accessRegions: NonNullable<ReturnType<typeof detectAccessCodeRegion>>[] = [];
+      if (!successfulPreview) {
+        setStatus("固定布局未得到 20 位结果，正在使用 ACCESS CODE 方格结构兜底定位…");
+        accessRegions = [
+          detection ? detectAccessCodeRegion(normalizedCard, cv) : null,
+          detectAccessCodeRegion(sourceCanvas, cv),
+        ]
+          .filter((region): region is NonNullable<typeof region> => Boolean(region))
+          .sort((a, b) => b.alignedBoxes - a.alignedBoxes)
+          .slice(0, 2);
+        setCardDetected(Boolean(detection || accessRegions.length));
+
+        anchorSearch: for (const accessRegion of accessRegions) {
+          for (const orientation of [
+            accessRegion.canvas,
+            rotateCanvas(accessRegion.canvas, 180),
+          ]) {
+            const prepared = prepareCrop(orientation, ACCESS_NUMBER_CROP, false);
+            if (
+              await recognizeLine(
+                prepared,
+                orientation,
+                "已匹配 ACCESS CODE 方格结构，正在读取上方数字",
+              )
+            ) {
+              usedAccessAnchor = true;
+              break anchorSearch;
+            }
+          }
+        }
+      }
+
+      if (!successfulPreview && groupReviewSource) {
+        setStatus("整行结果接近 20 位，正在按五组四位结构进行一次最终复核…");
+        await workerRef.current!.setParameters({
+          tessedit_pageseg_mode: tesseract.PSM.SINGLE_WORD,
+        });
+        try {
+          const groupResults: Candidate[] = [];
+          for (const group of splitIntoCodeGroups(groupReviewSource)) {
+            const result = await workerRef.current!.recognize(group);
+            groupResults.push({
+              text: result.data.text.trim(),
+              digits: result.data.text.replace(/\D/g, ""),
+              confidence: result.data.confidence,
+            });
+          }
+          const grouped: Candidate = {
+            text: groupResults.map((group) => group.text).join(" "),
+            digits: groupResults.map((group) => group.digits).join(""),
+            confidence:
+              groupResults.reduce((sum, group) => sum + group.confidence, 0) /
+              groupResults.length,
+          };
+          if (!best || scoreCandidate(grouped) < scoreCandidate(best)) best = grouped;
+          if (grouped.digits.length === 20) {
+            successfulPreview = groupReviewPreview ?? normalizedCard;
+          }
+        } finally {
+          await workerRef.current!.setParameters({
+            tessedit_pageseg_mode: tesseract.PSM.RAW_LINE,
+          });
+        }
+      }
+
+      // recognizeLine mutates this closure variable, which TypeScript's
       // control-flow analysis cannot infer across awaited nested calls.
       const finalCandidate = best as Candidate | null;
       const found = finalCandidate?.digits ?? "";
@@ -1089,9 +1136,9 @@ export default function CardScanner() {
       setRawText(finalCandidate?.text ?? "");
       setConfidence(finalCandidate?.confidence ?? null);
       if (successfulPreview) {
-        sourceCanvas.width = successfulPreview.width;
-        sourceCanvas.height = successfulPreview.height;
-        sourceCanvas.getContext("2d")?.drawImage(successfulPreview, 0, 0);
+        previewCanvas.width = successfulPreview.width;
+        previewCanvas.height = successfulPreview.height;
+        previewCanvas.getContext("2d")?.drawImage(successfulPreview, 0, 0);
         setCorrected(true);
       }
       setProgress(1);
@@ -1099,16 +1146,14 @@ export default function CardScanner() {
         setStatus(
           usedAccessAnchor
             ? "已通过 ACCESS CODE 字符框定位并识别出 20 位数字，请核对后使用"
-            : detection
-              ? "已自动校正卡片并识别出 20 位数字，请核对后使用"
-            : "已从整张照片识别出 20 位数字，请核对后使用",
+            : usedFixedLayout
+              ? "已在固定卡片坐标中识别出 20 位数字，请核对后使用"
+              : "已按五组四位结构复核出 20 位数字，请核对后使用",
         );
       } else if (!accessRegions.length && !detection) {
-        setStatus("未找到 ACCESS CODE 字符框或完整卡片边缘；请靠近一些并避免反光");
-      } else if (accessRegions.length && found.length) {
-        setStatus(`已完成多阶段复核，但最佳候选只有 ${found.length} 位，未作为有效结果输出`);
+        setStatus("未找到完整卡片边缘或 ACCESS CODE 方格结构；请确保卡片四角都在画面内");
       } else if (found.length) {
-        setStatus(`卡片已校正，但只识别到 ${found.length} 位数字；请换一张更清晰的照片`);
+        setStatus(`已完成多阶段复核，但最佳候选只有 ${found.length} 位，未作为有效结果输出`);
       } else {
         setStatus("卡片已校正，但没有可靠识别到 ACCESS CODE；请换一张更清晰的照片");
       }
